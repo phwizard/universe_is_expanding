@@ -1,0 +1,64 @@
+# (c) DeepX, Taras Filatov, 2025
+
+# semantic_api_backend/main.py
+from fastapi import FastAPI
+from pydantic import BaseModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import numpy as np
+import faiss
+from typing import List
+
+app = FastAPI()
+
+# Load LLM and tokenizer
+model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
+model.eval()
+
+# Get embedding function
+@torch.no_grad()
+def get_embedding(text: str):
+    tokens = tokenizer(text, return_tensors="pt", truncation=True)
+    outputs = model(**tokens, output_hidden_states=True)
+    hidden = outputs.hidden_states[-1].squeeze(0)
+    return hidden.mean(dim=0).cpu().numpy()
+
+# In-memory FAISS index (768D is typical for small models; adjust as needed)
+DIM = model.config.hidden_size
+index = faiss.IndexFlatL2(DIM)
+sentence_store = []
+
+class TextRequest(BaseModel):
+    sentence: str
+
+class EmbedRequest(BaseModel):
+    sentence: str
+    neighbors: int = 5
+
+@app.post("/expand")
+def expand_ideas(req: TextRequest):
+    prompt = req.sentence + "\n-"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    with torch.no_grad():
+        output = model.generate(input_ids, max_new_tokens=60, do_sample=True, temperature=0.8)
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    lines = [line.strip("- ").strip() for line in generated_text.split("\n") if line.strip().startswith("-")]
+    return {"ideas": lines if lines else [generated_text.strip()]}
+
+@app.post("/embed")
+def embed_sentence(req: EmbedRequest):
+    emb = get_embedding(req.sentence)
+    sentence_store.append(req.sentence)
+    index.add(np.array([emb]).astype(np.float32))
+    return {"message": "Sentence embedded and added."}
+
+@app.post("/search")
+def search_neighbors(req: EmbedRequest):
+    if index.ntotal == 0:
+        return {"neighbors": []}
+    emb = get_embedding(req.sentence).astype(np.float32).reshape(1, -1)
+    D, I = index.search(emb, req.neighbors)
+    results = [sentence_store[i] for i in I[0] if i < len(sentence_store)]
+    return {"neighbors": results}
